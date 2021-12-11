@@ -9449,8 +9449,10 @@ void __init sched_init(void)
 		rq->balance_callback = &balance_push_callback;
 		rq->active_balance = 0;
 		rq->next_balance = jiffies;
+#ifdef CONFIG_TT_SCHED
 		rq->lat_decay = jiffies;
 		rq->grq_next_balance = jiffies;
+#endif
 		rq->push_cpu = 0;
 		rq->cpu = i;
 #ifdef CONFIG_TT_SCHED
