@@ -5,7 +5,7 @@
 
 choice
 	prompt "Timer frequency"
-	default HZ_250
+	default HZ_500
 	help
 	 Allows the configuration of the timer frequency. It is customary
 	 to have the timer interrupt run at 1000 Hz but 100 Hz may be more
@@ -40,11 +40,31 @@ choice
 	 on SMP and NUMA systems and exactly dividing by both PAL and
 	 NTSC frame rates for video and multimedia work.
 
+	config HZ_500
+		bool "500 HZ"
+	help
+	 500 Hz is a balanced timer frequency. Provides fast interactivity
+	 on desktops with great smoothness without increasing CPU power
+	 consumption and sacrificing the battery life on laptops.
+
+	config HZ_720
+		bool "720 HZ"
+
 	config HZ_1000
 		bool "1000 HZ"
 	help
 	 1000 Hz is the preferred choice for desktop systems and other
 	 systems requiring fast interactive responses to events.
+
+	config HZ_1200
+		bool "1200 HZ"
+
+	config HZ_2400
+		bool "2400 HZ"
+
+	config HZ_3600
+		bool "3600 HZ"
+
 
 endchoice
 
@@ -53,7 +73,12 @@ config HZ
 	default 100 if HZ_100
 	default 250 if HZ_250
 	default 300 if HZ_300
+	default 500 if HZ_500
+	default 720 if HZ_720
 	default 1000 if HZ_1000
+	default 1200 if HZ_1200
+	default 2400 if HZ_2400
+	default 3600 if HZ_3600
 
 config SCHED_HRTICK
 	def_bool HIGH_RES_TIMERS
