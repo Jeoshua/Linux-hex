@@ -165,6 +165,11 @@ struct page {
 			void *hugetlb_hwpoison;
 			/* No more space on 32-bit: use third tail if more */
 		};
+		struct { /* Third tail page of compound page */
+			unsigned long _compound_pad_3; /* compound_head */
+			unsigned long _compound_pad_4;
+			struct list_head underutilized_thp_list;
+		};
 		struct {	/* Page table pages */
 			unsigned long _pt_pad_1;	/* compound_head */
 			pgtable_t pmd_huge_pte; /* protected by page->ptl */
