@@ -664,6 +664,10 @@ retry:
 	 * by the unlock path in user space after setting the futex value
 	 * to zero or by the kernel after setting the OWNER_DIED bit below.
 	 *
+	 * In the second case, the wake up notification could be generated
+	 * by the unlock path in user space after setting the futex value
+	 * to zero or by the kernel after setting the OWNER_DIED bit below.
+	 *
 	 * In both cases the TID validation below prevents a wakeup of
 	 * potential waiters which can cause these waiters to block
 	 * forever.
