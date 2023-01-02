@@ -50,6 +50,22 @@
 #define AMD_PSTATE_TRANSITION_LATENCY	20000
 #define AMD_PSTATE_TRANSITION_DELAY	1000
 
+typedef int (*cppc_mode_transition_fn)(int);
+
+enum amd_pstate_mode {
+	CPPC_DISABLE = 0,
+	CPPC_PASSIVE,
+	CPPC_GUIDED,
+	CPPC_MODE_MAX,
+};
+
+static const char * const amd_pstate_mode_string[] = {
+	[CPPC_DISABLE]     = "disable",
+	[CPPC_PASSIVE]     = "passive",
+	[CPPC_GUIDED]      = "guided",
+	NULL,
+};
+
 /*
  * TODO: We need more time to fine tune processors with shared memory solution
  * with community together.
@@ -60,7 +76,20 @@
  * module parameter to be able to enable it manually for debugging.
  */
 static struct cpufreq_driver amd_pstate_driver;
-static int cppc_load __initdata;
+static int cppc_state = CPPC_DISABLE;
+
+static inline int get_mode_idx_from_str(const char *str, size_t size)
+{
+	int i = 0;
+
+	for (; i < CPPC_MODE_MAX; ++i) {
+		if (!strncmp(str, amd_pstate_mode_string[i], size))
+			return i;
+	}
+	return -EINVAL;
+}
+
+static DEFINE_MUTEX(amd_pstate_driver_lock);
 
 static inline int pstate_enable(bool enable)
 {
@@ -134,6 +163,22 @@ static int cppc_init_perf(struct amd_cpudata *cpudata)
 	WRITE_ONCE(cpudata->lowest_nonlinear_perf,
 		   cppc_perf.lowest_nonlinear_perf);
 	WRITE_ONCE(cpudata->lowest_perf, cppc_perf.lowest_perf);
+
+	ret = cppc_get_auto_sel_caps(cpudata->cpu, &cppc_perf);
+	if (ret) {
+		pr_warn("WYES_DEBUG: failed to get auto_sel caps\n");
+		return 0;
+	}
+
+	pr_info("WYES_DEBUG: auto_sel: %d\n", cppc_perf.auto_sel);
+
+	if (cppc_state == CPPC_PASSIVE)
+		ret = cppc_set_auto_sel(cpudata->cpu, 0);
+	else if (cppc_state == CPPC_GUIDED)
+		ret = cppc_set_auto_sel(cpudata->cpu, 1);
+
+	if (ret)
+		pr_warn("WYES_DEBUG: failed to set auto_sel caps\n");
 
 	return 0;
 }
@@ -212,12 +257,18 @@ static inline bool amd_pstate_sample(struct amd_cpudata *cpudata)
 }
 
 static void amd_pstate_update(struct amd_cpudata *cpudata, u32 min_perf,
-			      u32 des_perf, u32 max_perf, bool fast_switch)
+			      u32 des_perf, u32 max_perf, bool fast_switch, int flags)
 {
 	u64 prev = READ_ONCE(cpudata->cppc_req_cached);
 	u64 value = prev;
 
 	des_perf = clamp_t(unsigned long, des_perf, min_perf, max_perf);
+
+	if (cppc_state == CPPC_GUIDED && flags & CPUFREQ_GOV_DYNAMIC_SWITCHING) {
+		min_perf = des_perf;
+		des_perf = 0;
+	}
+
 	value &= ~AMD_CPPC_MIN_PERF(~0L);
 	value |= AMD_CPPC_MIN_PERF(min_perf);
 
@@ -272,7 +323,7 @@ static int amd_pstate_target(struct cpufreq_policy *policy,
 
 	cpufreq_freq_transition_begin(policy, &freqs);
 	amd_pstate_update(cpudata, min_perf, des_perf,
-			  max_perf, false);
+			  max_perf, false, policy->governor->flags);
 	cpufreq_freq_transition_end(policy, &freqs, false);
 
 	return 0;
@@ -306,7 +357,8 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
 	if (max_perf < min_perf)
 		max_perf = min_perf;
 
-	amd_pstate_update(cpudata, min_perf, des_perf, max_perf, true);
+	amd_pstate_update(cpudata, min_perf, des_perf, max_perf, true,
+			policy->governor->flags);
 }
 
 static int amd_get_min_freq(struct amd_cpudata *cpudata)
@@ -591,6 +643,137 @@ static ssize_t show_amd_pstate_highest_perf(struct cpufreq_policy *policy,
 	return sprintf(&buf[0], "%u\n", perf);
 }
 
+static int amd_pstate_driver_cleanup(void)
+{
+	amd_pstate_enable(false);
+	cppc_state = CPPC_DISABLE;
+	return 0;
+}
+
+static int amd_pstate_register_driver(int mode)
+{
+	int ret;
+
+	ret = cpufreq_register_driver(&amd_pstate_driver);
+	if (ret) {
+		amd_pstate_driver_cleanup();
+		return ret;
+	}
+
+	cppc_state = mode;
+	return 0;
+}
+
+static int amd_pstate_unregister_driver(int dummy)
+{
+	int ret;
+
+	ret = cpufreq_unregister_driver(&amd_pstate_driver);
+
+	if (ret)
+		return ret;
+
+	amd_pstate_driver_cleanup();
+	return 0;
+}
+
+static int amd_pstate_change_driver_mode(int mode)
+{
+	int cpu = 0;
+
+	cppc_state = mode;
+	if (!boot_cpu_has(X86_FEATURE_CPPC)) {
+		if (cppc_state == CPPC_PASSIVE) {
+			for_each_present_cpu(cpu) {
+				cppc_set_auto_sel(cpu, 0);
+			}
+		} else if (cppc_state == CPPC_GUIDED) {
+			for_each_present_cpu(cpu) {
+				cppc_set_auto_sel(cpu, 1);
+			}
+		}
+	}
+	return 0;
+}
+
+/* Mode transition table */
+cppc_mode_transition_fn mode_state_machine[CPPC_MODE_MAX][CPPC_MODE_MAX] = {
+	[CPPC_DISABLE]         = {
+		[CPPC_DISABLE]     = NULL,
+		[CPPC_PASSIVE]     = amd_pstate_register_driver,
+		[CPPC_GUIDED]      = amd_pstate_register_driver,
+	},
+	[CPPC_PASSIVE]         = {
+		[CPPC_DISABLE]     = amd_pstate_unregister_driver,
+		[CPPC_PASSIVE]     = NULL,
+		[CPPC_GUIDED]      = amd_pstate_change_driver_mode,
+	},
+	[CPPC_GUIDED]          = {
+		[CPPC_DISABLE]     = amd_pstate_unregister_driver,
+		[CPPC_PASSIVE]     = amd_pstate_change_driver_mode,
+		[CPPC_GUIDED]      = NULL,
+	},
+};
+
+static int amd_pstate_update_status(const char *buf, size_t size)
+{
+	int mode_req = 0;
+
+	mode_req = get_mode_idx_from_str(buf, size);
+
+	if (mode_req < 0 || mode_req >= CPPC_MODE_MAX)
+		return -EINVAL;
+
+	if (mode_state_machine[cppc_state][mode_req])
+		return mode_state_machine[cppc_state][mode_req](mode_req);
+	return -EBUSY;
+}
+
+static ssize_t amd_pstate_show_status(char *buf)
+{
+	int i, j = 0;
+
+	for (i = 0; i < CPPC_MODE_MAX; ++i) {
+		if (i == cppc_state)
+			j += sprintf(buf + j, "[%s] ", amd_pstate_mode_string[i]);
+		else
+			j += sprintf(buf + j, "%s ", amd_pstate_mode_string[i]);
+	}
+	j += sprintf(buf + j, "\n");
+	return j;
+}
+
+static ssize_t state_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	ssize_t ret = 0;
+	char *p = memchr(buf, '\n', count);
+
+	mutex_lock(&amd_pstate_driver_lock);
+	ret = amd_pstate_update_status(buf, p ? p - buf : count);
+	mutex_unlock(&amd_pstate_driver_lock);
+
+	return ret < 0 ? ret : count;
+}
+static ssize_t state_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	int ret;
+
+	mutex_lock(&amd_pstate_driver_lock);
+	ret = amd_pstate_show_status(buf);
+	mutex_unlock(&amd_pstate_driver_lock);
+	return ret;
+}
+
+static struct kobj_attribute state_attr = __ATTR_RW(state);
+static struct attribute *amd_pstate_attrs[] = {
+	&state_attr.attr,
+	NULL,
+};
+
+ATTRIBUTE_GROUPS(amd_pstate);
+
 cpufreq_freq_attr_ro(amd_pstate_max_freq);
 cpufreq_freq_attr_ro(amd_pstate_lowest_nonlinear_freq);
 
@@ -616,6 +799,25 @@ static struct cpufreq_driver amd_pstate_driver = {
 	.attr		= amd_pstate_attr,
 };
 
+static struct kobject *amd_pstate_kobject;
+
+static void __init amd_pstate_sysfs_expose_param(void)
+{
+	int ret = 0;
+
+	amd_pstate_kobject = kobject_create_and_add("amd_pstate",
+		&cpu_subsys.dev_root->kobj);
+
+	if (WARN_ON(!amd_pstate_kobject))
+		return;
+
+	ret = sysfs_create_groups(amd_pstate_kobject, amd_pstate_groups);
+	if (ret) {
+		pr_err("sysfs group creation failed (%d)", ret);
+		return;
+	}
+}
+
 static int __init amd_pstate_init(void)
 {
 	int ret;
@@ -627,7 +829,7 @@ static int __init amd_pstate_init(void)
 	 * enable the amd_pstate passive mode driver explicitly
 	 * with amd_pstate=passive in kernel command line
 	 */
-	if (!cppc_load) {
+	if (cppc_state == CPPC_DISABLE) {
 		pr_debug("driver load is disabled, boot with amd_pstate=passive to enable this\n");
 		return -ENODEV;
 	}
@@ -663,6 +865,7 @@ static int __init amd_pstate_init(void)
 	if (ret)
 		pr_err("failed to register amd_pstate_driver with return %d\n",
 		       ret);
+	amd_pstate_sysfs_expose_param();
 
 	return ret;
 }
@@ -670,16 +873,22 @@ device_initcall(amd_pstate_init);
 
 static int __init amd_pstate_param(char *str)
 {
+	int size, mode_idx;
+
 	if (!str)
 		return -EINVAL;
 
-	if (!strcmp(str, "disable")) {
-		cppc_load = 0;
-		pr_info("driver is explicitly disabled\n");
-	} else if (!strcmp(str, "passive"))
-		cppc_load = 1;
+	size = strlen(str);
+	mode_idx = get_mode_idx_from_str(str, size);
 
-	return 0;
+	if (mode_idx >= CPPC_DISABLE && mode_idx < CPPC_MODE_MAX) {
+		cppc_state = mode_idx;
+		if (cppc_state == CPPC_DISABLE)
+			pr_info("driver is explicitly disabled\n");
+		return 0;
+	}
+
+	return -EINVAL;
 }
 early_param("amd_pstate", amd_pstate_param);
 
