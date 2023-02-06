@@ -512,7 +512,7 @@ int elv_register_queue(struct request_queue *q, bool uevent)
 		if (uevent)
 			kobject_uevent(&e->kobj, KOBJ_ADD);
 
-		e->registered = 1;
+		set_bit(ELEVATOR_FLAG_REGISTERED, &e->flags);
 	}
 	return error;
 }
@@ -523,13 +523,9 @@ void elv_unregister_queue(struct request_queue *q)
 
 	lockdep_assert_held(&q->sysfs_lock);
 
-	if (e && e->registered) {
-		struct elevator_queue *e = q->elevator;
-
+	if (e && test_and_clear_bit(ELEVATOR_FLAG_REGISTERED, &e->flags)) {
 		kobject_uevent(&e->kobj, KOBJ_REMOVE);
 		kobject_del(&e->kobj);
-
-		e->registered = 0;
 	}
 }
 
@@ -640,8 +636,13 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
 
 	if (q->nr_hw_queues != 1 &&
 	    !blk_mq_is_shared_tags(q->tag_set->flags))
+#if defined(CONFIG_CACHY) && defined(CONFIG_MQ_IOSCHED_KYBER)
+		return elevator_get(q, "kyber", false);
+#elif defined(CONFIG_CACHY)
+		return elevator_get(q, "mq-deadline", false);
+#else
 		return NULL;
-
+#endif
 	return elevator_get(q, "mq-deadline", false);
 }
 

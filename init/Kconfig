@@ -123,6 +123,10 @@ config THREAD_INFO_IN_TASK
 
 menu "General setup"
 
+config CACHY
+    bool "Some kernel tweaks by CachyOS"
+    default y
+
 config BROKEN
 	bool
 
@@ -345,6 +349,19 @@ config KERNEL_UNCOMPRESSED
 	  and jump right at uncompressed kernel image.
 
 endchoice
+
+menu "ZSTD compression options"
+	depends on KERNEL_ZSTD
+
+config ZSTD_COMP_VAL
+	int "Compression level (1-22)"
+	range 1 22
+	default "22"
+	help
+	  Choose a compression level for zstd kernel compression.
+	  Default is 22, which is the maximum.
+
+endmenu
 
 config DEFAULT_INIT
 	string "Default init path"
@@ -1251,6 +1268,22 @@ config USER_NS
 
 	  If unsure, say N.
 
+config USER_NS_UNPRIVILEGED
+	bool "Allow unprivileged users to create namespaces"
+	default y
+	depends on USER_NS
+	help
+	  When disabled, unprivileged users will not be able to create
+	  new namespaces. Allowing users to create their own namespaces
+	  has been part of several recent local privilege escalation
+	  exploits, so if you need user namespaces but are
+	  paranoid^Wsecurity-conscious you want to disable this.
+
+	  This setting can be overridden at runtime via the
+	  kernel.unprivileged_userns_clone sysctl.
+
+	  If unsure, say Y.
+
 config PID_NS
 	bool "PID Namespaces"
 	default y
@@ -1417,6 +1450,12 @@ config CC_OPTIMIZE_FOR_PERFORMANCE
 	  This is the default optimization level for the kernel, building
 	  with the "-O2" compiler flag for best performance and most
 	  helpful compile-time warnings.
+
+config CC_OPTIMIZE_FOR_PERFORMANCE_O3
+	bool "Optimize more for performance (-O3)"
+	help
+	  Choosing this option will pass "-O3" to your compiler to optimize
+	  the kernel yet more for performance.
 
 config CC_OPTIMIZE_FOR_SIZE
 	bool "Optimize for size (-Os)"
@@ -1726,6 +1765,19 @@ config KALLSYMS
 	  Say Y here to let the kernel print out symbolic crash information and
 	  symbolic stack backtraces. This increases the size of the kernel
 	  somewhat, as all symbols have to be loaded into the kernel image.
+
+config KALLSYMS_SELFTEST
+	bool "Test the basic functions and performance of kallsyms"
+	depends on KALLSYMS
+	default n
+	help
+	  Test the basic functions and performance of some interfaces, such as
+	  kallsyms_lookup_name. It also calculates the compression rate of the
+	  kallsyms compression algorithm for the current symbol set.
+
+	  Start self-test automatically after system startup. Suggest executing
+	  "dmesg | grep kallsyms_selftest" to collect test results. "finish" is
+	  displayed in the last line, indicating that the test is complete.
 
 config KALLSYMS_ALL
 	bool "Include all symbols in kallsyms"
