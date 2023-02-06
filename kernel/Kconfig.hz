@@ -61,11 +61,26 @@ choice
 	 on desktops with good smoothness without increasing CPU power
 	 consumption and sacrificing the battery life on laptops.
 
+	config HZ_833
+		bool "833 HZ"
+	help
+	 833 Hz is the TT alternative to 1000 Hz. Choose 833 Hz
+	 if you want a balance between latency and performance.
+
 	config HZ_1000
 		bool "1000 HZ"
 	help
 	 1000 Hz is the preferred choice for desktop systems and other
 	 systems requiring fast interactive responses to events.
+
+	config HZ_2400
+		bool "2400 HZ"
+	help
+	 2400 Hz is for very high latency bound systems. Choose 2400 Hz
+	 if you don't care about overall throughput or performance, but
+	 you care more about latency (some realtime applications) require
+	 low latency. The response and interactive processes with 2400 Hz
+	 feel much snappier.
 
 endchoice
 
@@ -78,6 +93,7 @@ config HZ
 	default 600 if HZ_600
 	default 750 if HZ_750
 	default 1000 if HZ_1000
+	default 2400 if HZ_2400
 
 config SCHED_HRTICK
 	def_bool HIGH_RES_TIMERS
