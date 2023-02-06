@@ -66,4 +66,5 @@ above structured documentation, or deleted if it has served its purpose.
    vmalloced-kernel-stacks
    vmemmap_dedup
    z3fold
+   zblock
    zsmalloc
