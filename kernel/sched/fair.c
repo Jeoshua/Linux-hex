@@ -1241,7 +1241,14 @@ update_stats_curr_start(struct cfs_rq *cfs_rq, struct sched_entity *se)
  * Scheduling class queueing methods:
  */
 
-static inline bool is_core_idle(int cpu)
+/**
+ * sched_smt_siblings_idle - Check whether SMT siblings of a CPU are idle
+ * @cpu:	The CPU to check
+ *
+ * Returns true if all the SMT siblings of @cpu are idle or @cpu does not have
+ * SMT siblings. The idle state of @cpu is not considered.
+ */
+bool sched_smt_siblings_idle(int cpu)
 {
 #ifdef CONFIG_SCHED_SMT
 	int sibling;
@@ -1947,7 +1954,7 @@ static inline int numa_idle_core(int idle_core, int cpu)
 	 * Prefer cores instead of packing HT siblings
 	 * and triggering future load balancing.
 	 */
-	if (is_core_idle(cpu))
+	if (sched_smt_siblings_idle(cpu))
 		idle_core = cpu;
 
 	return idle_core;
@@ -9202,6 +9209,13 @@ struct sg_lb_stats {
 	unsigned int nr_numa_running;
 	unsigned int nr_preferred_running;
 #endif
+#ifdef CONFIG_IPC_CLASSES
+	unsigned long min_score; /* Min(score(rq->curr->ipcc)) */
+	unsigned short min_ipcc; /* Class of the task with the minimum IPCC score in the rq */
+	unsigned long sum_score; /* Sum(score(rq->curr->ipcc)) */
+	long ipcc_score_after; /* Prospective IPCC score after load balancing */
+	unsigned long ipcc_score_before; /* IPCC score before load balancing */
+#endif
 };
 
 /*
@@ -9536,6 +9550,226 @@ group_type group_classify(unsigned int imbalance_pct,
 	return group_has_spare;
 }
 
+#ifdef CONFIG_IPC_CLASSES
+static void init_rq_ipcc_stats(struct sg_lb_stats *sgs)
+{
+	/* All IPCC stats have been set to zero in update_sg_lb_stats(). */
+	sgs->min_score = ULONG_MAX;
+}
+
+/* Called only if cpu_of(@rq) is not idle and has tasks running. */
+static void update_sg_lb_ipcc_stats(int dst_cpu, struct sg_lb_stats *sgs,
+				    struct rq *rq)
+{
+	struct task_struct *curr;
+	unsigned short ipcc;
+	unsigned long score;
+
+	if (!sched_ipcc_enabled())
+		return;
+
+	curr = rcu_dereference(rq->curr);
+	if (!curr || (curr->flags & PF_EXITING) || is_idle_task(curr) ||
+	    task_is_realtime(curr) ||
+	    !cpumask_test_cpu(dst_cpu, curr->cpus_ptr))
+		return;
+
+	ipcc = curr->ipcc;
+	score = arch_get_ipcc_score(ipcc, cpu_of(rq));
+
+	/*
+	 * Ignore tasks with invalid scores. When finding the busiest group, we
+	 * prefer those with higher sum_score. This group will not be selected.
+	 */
+	if (IS_ERR_VALUE(score))
+		return;
+
+	sgs->sum_score += score;
+
+	if (score < sgs->min_score) {
+		sgs->min_score = score;
+		sgs->min_ipcc = ipcc;
+	}
+}
+
+static void update_sg_lb_stats_scores(struct sg_lb_stats *sgs,
+				      struct sched_group *sg,
+				      struct lb_env *env)
+{
+	unsigned long score_on_dst_cpu, before;
+	int busy_cpus;
+	long after;
+
+	if (!sched_ipcc_enabled())
+		return;
+
+	/*
+	 * IPCC scores are only useful during idle load balancing. For now,
+	 * only asym_packing uses IPCC scores.
+	 */
+	if (!(env->sd->flags & SD_ASYM_PACKING) ||
+	    env->idle == CPU_NOT_IDLE)
+		return;
+
+	/*
+	 * IPCC scores are used to break ties only between these types of
+	 * groups.
+	 */
+	if (sgs->group_type != group_fully_busy &&
+	    sgs->group_type != group_asym_packing)
+		return;
+
+	busy_cpus = sgs->group_weight - sgs->idle_cpus;
+
+	/* No busy CPUs in the group. No tasks to move. */
+	if (!busy_cpus)
+		return;
+
+	score_on_dst_cpu = arch_get_ipcc_score(sgs->min_ipcc, env->dst_cpu);
+
+	/*
+	 * Do not use IPC scores. sgs::ipcc_score_{after, before} will be zero
+	 * and not used.
+	 */
+	if (IS_ERR_VALUE(score_on_dst_cpu))
+		return;
+
+	before = sgs->sum_score;
+	after = before - sgs->min_score;
+
+	/* SMT siblings share throughput. */
+	if (busy_cpus > 1 && sg->flags & SD_SHARE_CPUCAPACITY) {
+		before /= busy_cpus;
+		/* One sibling will become idle after load balance. */
+		after /= busy_cpus - 1;
+	}
+
+	sgs->ipcc_score_after = after + score_on_dst_cpu;
+	sgs->ipcc_score_before = before;
+}
+
+/**
+ * sched_asym_ipcc_prefer - Select a sched group based on its IPCC score
+ * @a:	Load balancing statistics of a sched group
+ * @b:	Load balancing statistics of a second sched group
+ *
+ * Returns: true if @a has a higher IPCC score than @b after load balance.
+ * False otherwise.
+ */
+static bool sched_asym_ipcc_prefer(struct sg_lb_stats *a,
+				   struct sg_lb_stats *b)
+{
+	if (!sched_ipcc_enabled())
+		return false;
+
+	/* @a increases overall throughput after load balance. */
+	if (a->ipcc_score_after > b->ipcc_score_after)
+		return true;
+
+	/*
+	 * If @a and @b yield the same overall throughput, pick @a if
+	 * its current throughput is lower than that of @b.
+	 */
+	if (a->ipcc_score_after == b->ipcc_score_after)
+		return a->ipcc_score_before < b->ipcc_score_before;
+
+	return false;
+}
+
+/**
+ * sched_asym_ipcc_pick - Select a sched group based on its IPCC score
+ * @a:		A scheduling group
+ * @b:		A second scheduling group
+ * @a_stats:	Load balancing statistics of @a
+ * @b_stats:	Load balancing statistics of @b
+ *
+ * Returns: true if @a has the same priority and @a has tasks with IPC classes
+ * that yield higher overall throughput after load balance. False otherwise.
+ */
+static bool sched_asym_ipcc_pick(struct sched_group *a,
+				 struct sched_group *b,
+				 struct sg_lb_stats *a_stats,
+				 struct sg_lb_stats *b_stats)
+{
+	/*
+	 * Only use the class-specific preference selection if both sched
+	 * groups have the same priority.
+	 */
+	if (arch_asym_cpu_priority(a->asym_prefer_cpu) !=
+	    arch_asym_cpu_priority(b->asym_prefer_cpu))
+		return false;
+
+	return sched_asym_ipcc_prefer(a_stats, b_stats);
+}
+
+/**
+ * ipcc_score_delta - Get the IPCC score delta wrt the load balance's dst_cpu
+ * @p:		A task
+ * @env:	Load balancing environment
+ *
+ * Returns: The IPCC score delta that @p would get if placed in the destination
+ * CPU of @env. LONG_MIN to indicate that the delta should not be used.
+ */
+static long ipcc_score_delta(struct task_struct *p, struct lb_env *env)
+{
+	unsigned long score_src, score_dst;
+	unsigned short ipcc = p->ipcc;
+
+	if (!sched_ipcc_enabled())
+		return LONG_MIN;
+
+	/* Only asym_packing uses IPCC scores at the moment. */
+	if (!(env->sd->flags & SD_ASYM_PACKING))
+		return LONG_MIN;
+
+	score_dst = arch_get_ipcc_score(ipcc, env->dst_cpu);
+	if (IS_ERR_VALUE(score_dst))
+		return LONG_MIN;
+
+	score_src = arch_get_ipcc_score(ipcc, task_cpu(p));
+	if (IS_ERR_VALUE(score_src))
+		return LONG_MIN;
+
+	return score_dst - score_src;
+}
+
+#else /* CONFIG_IPC_CLASSES */
+static void update_sg_lb_ipcc_stats(int dst_cpu, struct sg_lb_stats *sgs,
+				    struct rq *rq)
+{
+}
+
+static void init_rq_ipcc_stats(struct sg_lb_stats *sgs)
+{
+}
+
+static void update_sg_lb_stats_scores(struct sg_lb_stats *sgs,
+				      struct sched_group *sg,
+				      struct lb_env *env)
+{
+}
+
+static bool sched_asym_ipcc_prefer(struct sg_lb_stats *a,
+				   struct sg_lb_stats *b)
+{
+	return false;
+}
+
+static bool sched_asym_ipcc_pick(struct sched_group *a,
+				 struct sched_group *b,
+				 struct sg_lb_stats *a_stats,
+				 struct sg_lb_stats *b_stats)
+{
+	return false;
+}
+
+static long ipcc_score_delta(struct task_struct *p, struct lb_env *env)
+{
+	return LONG_MIN;
+}
+
+#endif /* CONFIG_IPC_CLASSES */
+
 /**
  * asym_smt_can_pull_tasks - Check whether the load balancing CPU can pull tasks
  * @dst_cpu:	Destination CPU of the load balancing
@@ -9587,7 +9821,8 @@ sched_asym(struct lb_env *env, struct sd_lb_stats *sds,  struct sg_lb_stats *sgs
 	 * If the destination CPU has SMT siblings, env->idle != CPU_NOT_IDLE
 	 * is not sufficient. We need to make sure the whole core is idle.
 	 */
-	if (sds->local->flags & SD_SHARE_CPUCAPACITY && !is_core_idle(env->dst_cpu))
+	if (sds->local->flags & SD_SHARE_CPUCAPACITY &&
+	    !sched_smt_siblings_idle(env->dst_cpu))
 		return false;
 
 	/* Only do SMT checks if either local or candidate have SMT siblings. */
@@ -9628,6 +9863,7 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 	int i, nr_running, local_group;
 
 	memset(sgs, 0, sizeof(*sgs));
+	init_rq_ipcc_stats(sgs);
 
 	local_group = group == sds->local;
 
@@ -9677,6 +9913,8 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 			if (sgs->group_misfit_task_load < load)
 				sgs->group_misfit_task_load = load;
 		}
+
+		update_sg_lb_ipcc_stats(env->dst_cpu, sgs, rq);
 	}
 
 	sgs->group_capacity = group->sgc->capacity;
@@ -9691,6 +9929,9 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 	}
 
 	sgs->group_type = group_classify(env->sd->imbalance_pct, group, sgs);
+
+	if (!local_group)
+		update_sg_lb_stats_scores(sgs, group, env);
 
 	/* Computing avg_load makes sense only when group is overloaded */
 	if (sgs->group_type == group_overloaded)
@@ -9763,6 +10004,16 @@ static bool update_sd_pick_busiest(struct lb_env *env,
 		/* Prefer to move from lowest priority CPU's work */
 		if (sched_asym_prefer(sg->asym_prefer_cpu, sds->busiest->asym_prefer_cpu))
 			return false;
+
+		/*
+		 * Unlike other callers of sched_asym_prefer(), here both @sg
+		 * and @sds::busiest have tasks running. When they have equal
+		 * priority, their IPC class scores can be used to select a
+		 * better busiest.
+		 */
+		if (sched_asym_ipcc_pick(sds->busiest, sg, &sds->busiest_stat, sgs))
+			return false;
+
 		break;
 
 	case group_misfit_task:
@@ -9793,10 +10044,21 @@ static bool update_sd_pick_busiest(struct lb_env *env,
 		if (sgs->avg_load == busiest->avg_load) {
 			/*
 			 * SMT sched groups need more help than non-SMT groups.
-			 * If @sg happens to also be SMT, either choice is good.
 			 */
-			if (sds->busiest->flags & SD_SHARE_CPUCAPACITY)
-				return false;
+			if (sds->busiest->flags & SD_SHARE_CPUCAPACITY) {
+				if (!(sg->flags & SD_SHARE_CPUCAPACITY))
+					return false;
+
+				/*
+				 * Between two SMT groups, use IPCC scores to pick the
+				 * one that would improve throughput the most (only
+				 * asym_packing uses IPCC scores for now).
+				 */
+				if (sched_ipcc_enabled() &&
+				    env->sd->flags & SD_ASYM_PACKING &&
+				    sched_asym_ipcc_prefer(busiest, sgs))
+					return false;
+			}
 		}
 
 		break;
@@ -10667,6 +10929,7 @@ static struct rq *find_busiest_queue(struct lb_env *env,
 {
 	struct rq *busiest = NULL, *rq;
 	unsigned long busiest_util = 0, busiest_load = 0, busiest_capacity = 1;
+	long busiest_ipcc_delta = LONG_MIN;
 	unsigned int busiest_nr = 0;
 	int i;
 
@@ -10728,7 +10991,8 @@ static struct rq *find_busiest_queue(struct lb_env *env,
 		    sched_asym_prefer(i, env->dst_cpu) &&
 		    nr_running == 1) {
 			if (env->sd->flags & SD_SHARE_CPUCAPACITY ||
-			    (!(env->sd->flags & SD_SHARE_CPUCAPACITY) && is_core_idle(i)))
+			    (!(env->sd->flags & SD_SHARE_CPUCAPACITY) &&
+			     sched_smt_siblings_idle(i)))
 				continue;
 		}
 
@@ -10783,8 +11047,35 @@ static struct rq *find_busiest_queue(struct lb_env *env,
 
 		case migrate_task:
 			if (busiest_nr < nr_running) {
+				struct task_struct *curr;
+
 				busiest_nr = nr_running;
 				busiest = rq;
+
+				/*
+				 * Remember the IPCC score delta of busiest::curr.
+				 * We may need it to break a tie with other queues
+				 * with equal nr_running.
+				 */
+				curr = rcu_dereference(busiest->curr);
+				busiest_ipcc_delta = ipcc_score_delta(curr, env);
+			/*
+			 * If rq and busiest have the same number of running
+			 * tasks and IPC classes are supported, pick rq if doing
+			 * so would give rq::curr a bigger IPC boost on dst_cpu.
+			 */
+			} else if (busiest_nr == nr_running) {
+				struct task_struct *curr;
+				long delta;
+
+				curr = rcu_dereference(rq->curr);
+				delta = ipcc_score_delta(curr, env);
+
+				if (busiest_ipcc_delta < delta) {
+					busiest_ipcc_delta = delta;
+					busiest_nr = nr_running;
+					busiest = rq;
+				}
 			}
 			break;
 
@@ -10830,7 +11121,7 @@ asym_active_balance(struct lb_env *env)
 		 * busy sibling.
 		 */
 		return sched_asym_prefer(env->dst_cpu, env->src_cpu) ||
-		       !is_core_idle(env->src_cpu);
+		       !sched_smt_siblings_idle(env->src_cpu);
 	}
 
 	return false;
@@ -11577,7 +11868,7 @@ static void nohz_balancer_kick(struct rq *rq)
 				 */
 				if (sd->flags & SD_SHARE_CPUCAPACITY ||
 				    (!(sd->flags & SD_SHARE_CPUCAPACITY) &&
-				     is_core_idle(i))) {
+				     sched_smt_siblings_idle(i))) {
 					flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
 					goto unlock;
 				}
